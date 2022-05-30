@@ -1,18 +1,29 @@
+{-# LANGUAGE RankNTypes #-}
+
 import           Control.Applicative        (liftA2)
 import           Control.Monad.State.Strict
-import           Data.List                  (sortOn)
+import           Data.Bits
+import           Data.List                  (intercalate, sortOn, transpose)
 import qualified Data.Map.Strict            as Map
-import           Data.Maybe                 (catMaybes)
+import           Data.Maybe                 (catMaybes, fromMaybe, listToMaybe)
 import           Data.Ratio                 (denominator, numerator)
+import           Text.Read                  (readMaybe)
 
 infixr 3 <&&>
-(<&&>) = liftA2 (&&) 
+(<&&>) = liftA2 (&&)
+
+infixr 2 `orElse`
+(Just x) `orElse` _ = Just x
+Nothing  `orElse` x = x
 
 data Type = ConcreteType (String, [Type]) | TypeVariable Int
 
 type TypeCheckerState = Map.Map Int Type
 
-typeCheck as bs = runState (_typeCheckN as bs) Map.empty
+typeCheck :: [Type] -> [Type] -> Maybe TypeCheckerState
+typeCheck as bs = 
+  let (result, state) = runState (_typeCheckN as bs) Map.empty
+  in if result then Just state else Nothing
   where
   _typeCheck :: Type -> Type -> State TypeCheckerState Bool
   _typeCheck (ConcreteType (aName, aArgs)) (ConcreteType (bName, bArgs))
@@ -39,46 +50,65 @@ substituteTypeVariables state (ConcreteType (name, args))
   = ConcreteType (name, map (substituteTypeVariables state) args)
 
 tNum = ConcreteType ("Number", [])
-tList = ConcreteType ("List", [TypeVariable 1])
+tList el = ConcreteType ("List", [el])
 
-type Op = StateT [Value] IO ()
+data Op = Literal Integer | Func (StateT [Value] IO ())
 
-data CompilerState = CompilerState { stackTypes :: [Type], out :: [Op] }
+data CompilerState = CompilerState{stackTypes :: [Type], out :: [Op]}
+type Compiler = CompilerState -> Maybe (Integer -> (Integer, CompilerState))
 
-compile :: Int -> Int -> State CompilerState Int
-compile 0     program = return program
-compile _     0       = return 0
+compile :: Integer -> Integer -> State CompilerState (Integer, Integer)
+compile 0     program = return (0, program)
+compile limit 0       = return (limit, 0)
 compile limit program = do
-  stack <- gets stackTypes
-  let validOps = catMaybes [op stack | op <- ops]
-  let (program, opIndex) = divMod (program - 1) (length validOps)
-  validOps !! opIndex
-  compile (limit - 1) program
+  state <- get
+  let validOps = catMaybes [op state | op <- ops]
+  let (program', opIndex) = divMod (program - 1) (toInteger $ length validOps)
+  let (program'', state') = (validOps !! fromInteger opIndex) program'
+  put state'
+  compile (limit - 1) program''
 
-typeCheckedOp :: [Type] -> [Type] -> Op -> [Type] -> Maybe (State CompilerState ())
-typeCheckedOp inputTypes outputTypes op stack = do
+typeCheckedOp :: [Type] -> [Type] -> Op -> Compiler
+typeCheckedOp inputTypes outputTypes op compilerState = do
     let arity = length inputTypes
-    case typeCheck inputTypes (take arity stack) of
-      (True, state) -> Just (op arity state)
-      (False, _)    -> Nothing
-    where op :: Int -> TypeCheckerState -> State CompilerState ()
-          op arity state = do
-            let concreteOutputTypes = map (substituteTypeVariables state) outputTypes
-            modify $ \s -> s { stackTypes = concreteOutputTypes ++ (drop arity $ stackTypes s) }
+    typeCheckerState <- typeCheck inputTypes (take arity $ stackTypes compilerState)
+    let concreteOutputTypes = map (substituteTypeVariables typeCheckerState) outputTypes
+    let state' = compilerState{stackTypes = concreteOutputTypes ++ (drop arity $ stackTypes compilerState)}
+    return $ \program -> (program, state')
 
-simpleOp :: [Type] -> Type -> ([Value] -> Value) -> [Type] -> Maybe (State CompilerState ())
+simpleOp :: [Type] -> Type -> ([Value] -> Value) -> Compiler
 simpleOp inputTypes outputType f
- = typeCheckedOp inputTypes [outputType] $ modify op
+ = typeCheckedOp inputTypes [outputType] $ Func $ modify op
  where op stack =
          let (args, rest) = splitAt (length inputTypes) stack
           in f args : rest
 
-ops :: [[Type] -> Maybe (State CompilerState ())]
-ops = map snd $ sortOn fst ops' where
-  ops' = [ -- duplicate
-          (0, typeCheckedOp [TypeVariable 1] [TypeVariable 1, TypeVariable 1] dup)
+literalOp :: Compiler
+literalOp compilerState = Just literal
+  where literal program =
+          let (x, program') = runState _literal program
+           in (program', compilerState{out = Literal x : out compilerState})
+        -- TODO use a better integer encoding
+        _literal = do
+          n <- gets (`mod` 256)
+          modify (`div` 256)
+          return n
+        {- a modified form of Elias Omega Coding
+        _literal :: State Integer Integer
+        _literal = do
+          bit1 <- takeBits 1
+          case bit1 of
+            0 -> _
+        takeBits n = state $ \x -> (x .&. 1 `shiftL` fromInteger n - 1, x `shiftR` fromInteger n)
+        -}
+
+
+ops :: [Compiler]
+ops = map snd $ sortOn fst _ops where
+  _ops = [ -- duplicate
+          (0, typeCheckedOp [TypeVariable 1] [TypeVariable 1, TypeVariable 1] $ Func dup)
           -- pop
-        , (1, typeCheckedOp [TypeVariable 1] [] pop)
+        , (1, typeCheckedOp [TypeVariable 1] [] $ Func pop)
           -- arithmetic
         , (2, simpleOp [tNum, tNum] tNum (\[x, y] -> x + y))
         , (3, simpleOp [tNum, tNum] tNum (\[x, y] -> x - y))
@@ -91,23 +121,86 @@ ops = map snd $ sortOn fst ops' where
     where pop = modify tail
           dup = modify $ \(x:rest) -> x:x:rest
 
-data Value = Int Integer | Float Double | List [Value]
+data Value
+  = Int Integer
+  | Float Double 
+  | Char Char
+  | List [Value]
+
+isString  (List s)        = _isString s
+  where
+    _isString (Char _ : rest) = _isString rest
+    _isString []              = True
+    _isString _               = False
+isString  _               = False
+
+-- conversion utilities
+makeString = List . map Char
+
+stringify :: Show a => a -> Value
+stringify = makeString . show
+
+hsString :: Value -> String
+hsString (List s) = _hsString s
+  where
+    _hsString (Char c : rest) = c : _hsString rest
+    _hsString []              = []
+    _hsString _               = error "not a string"
+hsString _ = error "not a string"
+
+makeBool False = Int 0
+makeBool True  = Int 1 
+
+instance Show Value where
+  show (Int x)        = show x
+  show (Float x)      = show x
+  show (Char x)       = show x
+  show x | isString x = show $ hsString x
+  show (List xs)      = '[' : intercalate ", " (map show xs) ++ "]"
+
+instance Read Value where
+  readsPrec precedence s = 
+    justs $ map (foldl orElse Nothing) $ transpose attempts
+      where
+        u constructor = maybes [(constructor val, rest) | (val, rest) <- readsPrec precedence s]
+        attempts =
+          [ u Int
+          , u Float
+          , u Char
+          , u List
+          , u makeString
+          , u makeBool
+          ]
+
+        maybes :: [a] -> [Maybe a]
+        maybes xs = map Just xs ++ repeat Nothing
+
+        justs (Just x : xs) = x : justs xs
+        justs _             = []
+
+
+-- try to parse x into a Value, but default to just taking `x` as a literal string
+readValue x = fromMaybe (makeString x) (readMaybe x)
+
+compareUtil :: forall b. (forall a. Ord a => a -> a -> b) -> Value -> Value -> b
+compareUtil f (Int x)   (Int y)   = f x y
+compareUtil f (Float x) (Float y) = f x y
+compareUtil f (Int x)   (Float y) = f (fromInteger x) y
+compareUtil f (Float x) (Int y)   = f x (fromInteger y)
+compareUtil f (List x)  (List y)  = f x y
+compareUtil f (List x)  y         = f x [y]
+compareUtil f x         (List y)  = f [x] y
+
+opUtil :: (forall a. Num a => a -> a -> a) -> Value -> Value -> Value
+opUtil f (Int x)   (Int y)   = Int (f x y)
+opUtil f (Float x) (Float y) = Float (f x y)
+opUtil f (Float x) (Int y)   = Float (f x (fromInteger y))
+opUtil f (Int x)   (Float y) = Float (f (fromInteger x) y)
 
 instance Num Value where
-  Int x   + Int y   = Int (x + y)
-  Float x + Float y = Float (x + y)
-  Int x   + Float y = Float (fromInteger x + y)
-  Float x + Int y   = Float (x + fromInteger y)
-
-  Int x   - Int y   = Int (x - y)
-  Float x - Float y = Float (x - y)
-  Int x   - Float y = Float (fromInteger x - y)
-  Float x - Int y   = Float (x - fromInteger y)
-
-  Int x   * Int y   = Int (x * y)
-  Float x * Float y = Float (x * y)
-  Int x   * Float y = Float (fromInteger x * y)
-  Float x * Int y   = Float (x * fromInteger y)
+  (+) = opUtil (+)
+  (-) = opUtil (-)
+  (*) = opUtil (*)
 
   abs (Int x)   = Int (abs x)
   abs (Float x) = Float (abs x)
@@ -122,39 +215,17 @@ instance Eq Value where
   Float x == Float y = x == y
   Int x   == Float y = fromInteger x == y
   Float x == Int y   = x == fromInteger y
+
   List x  == List y  = x == y
+
   _       == _       = False
 
 instance Ord Value where
-  Int x   `compare` Int y   = x `compare` y
-  Float x `compare` Float y = x `compare` y
-  Int x   `compare` Float y = fromInteger x `compare` y
-  Float x `compare` Int y   = x `compare` fromInteger y
-  List x  `compare` List y  = x `compare` y
-
-  Int x   > Int y   = x > y
-  Float x > Float y = x > y
-  Int x   > Float y = fromInteger x > y
-  Float x > Int y   = x > fromInteger y
-  List x  > List y  = x > y
-
-  Int x   < Int y   = x < y
-  Float x < Float y = x < y
-  Int x   < Float y = fromInteger x < y
-  Float x < Int y   = x < fromInteger y
-  List x  < List y  = x < y
-
-  Int x   >= Int y   = x >= y
-  Float x >= Float y = x >= y
-  Int x   >= Float y = fromInteger x >= y
-  Float x >= Int y   = x >= fromInteger y
-  List x  >= List y  = x >= y
-
-  Int x   <= Int y   = x <= y
-  Float x <= Float y = x <= y
-  Int x   <= Float y = fromInteger x <= y
-  Float x <= Int y   = x <= fromInteger y
-  List x  <= List y  = x <= y
+  compare = compareUtil compare
+  (>) = compareUtil (>)
+  (<) = compareUtil (<)
+  (>=) = compareUtil (>=)
+  (<=) = compareUtil (<=)
 
 instance Enum Value where
   toEnum x = Int (toInteger x)
@@ -166,6 +237,7 @@ instance Fractional Value where
   Float x / Float y = Float (x / y)
   Int x   / Float y = Float (fromInteger x / y)
   Float x / Int y   = Float (x / fromInteger y)
+
   fromRational x
     | denominator x == 1
     = Int (numerator x)
@@ -185,11 +257,13 @@ instance Integral Value where
        in (Int n, Float (d - fromInteger n))
   Int x `quotRem` Float y = Float (fromInteger x) `quotRem` Float y
   Float x `quotRem` Int y = Float x `quotRem` Float (fromInteger y)
+
   toInteger (Int x)   = x
   toInteger (Float x) = truncate x
 
 floatUtil f (Float x) = Float (f x)
 floatUtil f (Int x)   = Float (f (fromInteger x))
+floatUtil f (List xs) = List $ map (floatUtil f) xs
 
 instance Floating Value where
   pi = Float pi
