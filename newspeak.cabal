@@ -9,7 +9,7 @@ library
     containers,
     mtl,
   exposed-modules:
-    Newspeak.Compiler
+    Newspeak.TypeChecker
 
 executable quince
   hs-source-dirs:      programs
@@ -24,6 +24,7 @@ test-suite test
   type: exitcode-stdio-1.0
   main-is: Test.hs
   other-modules:
+    TypeCheckerSpec
   hs-source-dirs:
     tests
   build-depends:
@@ -31,3 +32,4 @@ test-suite test
     newspeak,
     hspec,
     QuickCheck,
+    containers,
