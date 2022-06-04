@@ -1,0 +1,33 @@
+cabal-version:       2.4
+name:                newspeak
+version:             0.1.0.0
+
+library
+  default-language:    Haskell2010
+  build-depends:
+    base,
+    containers,
+    mtl,
+  exposed-modules:
+    Newspeak.Compiler
+
+executable quince
+  hs-source-dirs:      programs
+  default-language:    Haskell2010
+  main-is:             Main.hs
+  build-depends:
+    base,
+    newspeak,
+
+test-suite test
+  default-language:    Haskell2010
+  type: exitcode-stdio-1.0
+  main-is: Test.hs
+  other-modules:
+  hs-source-dirs:
+    tests
+  build-depends:
+    base,
+    newspeak,
+    hspec,
+    QuickCheck,

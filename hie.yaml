@@ -1,0 +1,8 @@
+cradle:
+  stack:
+    - path: "./Newspeak"
+      component: "newspeak:lib"
+    - path: "./Main.hs"
+      component: "newspeak:exe:newspeak"
+    - path: "./tests"
+      component: "newspeak:test:test"

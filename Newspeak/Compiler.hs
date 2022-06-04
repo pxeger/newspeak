@@ -1,5 +1,7 @@
 {-# LANGUAGE RankNTypes #-}
 
+module Newspeak.Compiler where
+
 import           Control.Applicative        (liftA2)
 import           Control.Monad.State.Strict
 import           Data.Bits
